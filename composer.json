@@ -1,0 +1,12 @@
+{
+    "name": "carlosrgl/crbc-import-matchs",
+    "description": "Plugin WordPress pour importer les matchs du CRBC66 depuis des fichiers Excel",
+    "require": {
+        "phpoffice/phpspreadsheet": "^2.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "CRBC\\ImportMatchs\\": "includes/"
+        }
+    }
+}
