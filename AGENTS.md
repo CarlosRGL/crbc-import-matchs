@@ -57,9 +57,66 @@ Only `post_title` matters. Each post represents an opponent team. Created automa
 
 ---
 
+## Architecture: AJAX Batch Processing
+
+The import uses a 2-phase AJAX approach for non-blocking processing with live progress feedback.
+
+### Phase 1 — Parse (`crbc_parse_files`)
+
+1. User uploads files via the admin form
+2. JS intercepts the submit and sends files to `crbc_parse_files` AJAX endpoint
+3. Endpoint validates .xlsx files, moves to temp dir (`wp-content/uploads/crbc-import-tmp/`)
+4. Calls `Importer::parse_file_to_rows()` to extract all rows as normalized arrays
+5. Stores rows + stats in a transient (`crbc_import_job_{uuid}`, 30min expiry)
+6. Returns `{ job_id, total_cal, total_res }`
+
+### Phase 2 — Batch Process (`crbc_process_batch`)
+
+1. JS loops through batches (default 5 rows each), first calendrier then résultats
+2. Each call sends `{ job_id, file_type, offset, batch_size }`
+3. Endpoint loads transient, processes the batch via `Importer::process_row_data()`
+4. Returns per-row results with `action`, `title`, `matched_as` (fuzzy match indicator)
+5. Stats accumulate across batches in the transient
+6. When done: temp files cleaned up, transient deleted
+
+### Transient Structure
+
+```json
+{
+  "calendrier": {
+    "rows": [...],
+    "total": 42,
+    "processed": 0,
+    "file_path": "/path/to/tmp/uuid-calendrier.xlsx",
+    "stats": { "created": 0, "updated": 0, "skipped": 0, "errors": [] }
+  },
+  "resultats": { ... }
+}
+```
+
+---
+
+## Fuzzy Name Matching (equipes-externes)
+
+The `find_or_create_opponent()` method uses a cascade strategy to match opponent names to existing `equipes-externes` posts. All opponents are preloaded into memory once per import run.
+
+### Cascade (stops at first hit):
+
+1. **Exact match** — case-insensitive, trimmed comparison
+2. **WP title contained in opponent name** — e.g. "NIMES" matches "NIMES BASKET". Longest match wins.
+3. **Opponent name contained in WP title** — reverse containment check
+4. **similar_text() > 60%** — PHP's built-in string similarity, highest percentage wins
+5. **Create new** — if no match found, creates a new `equipes-externes` post
+
+Fuzzy matches (steps 2–4) are reported in batch results as `"matched_as": "EXISTING_NAME"` for debugging.
+
+Newly created opponents are added to the in-memory cache (`$all_opponents`) to prevent duplicate creation within the same import run.
+
+---
+
 ## Import Logic
 
-1. **Skip** rows where Equipe 1 or Equipe 2 = "Exempt"
+1. **Skip** rows where Equipe 1 or Equipe 2 = "Exempt" (done at parse time)
 2. **Detect home/away**: "CANET RBC" in Equipe 1 → home (`0`), in Equipe 2 → away (`1`)
 3. **Opponent** = the team that is NOT "CANET RBC"
 4. **Clean opponent name**:
@@ -67,7 +124,7 @@ Only `post_title` matters. Each post represents an opponent team. Created automa
    - Strip trailing ` - N (X)` suffix (regex: `/ - \d+ \(\d+\)$/`)
    - Strip trailing ` (X)` suffix (regex: `/ \(\d+\)$/`)
    - Trim whitespace
-5. **Find/create** `equipes-externes` post (case-insensitive title match)
+5. **Find/create** `equipes-externes` post (fuzzy cascade match)
 6. **Find/create** `equipes-crbc` taxonomy term for the division
 7. **Duplicate check**: query `matchs` by `date_du_match` + `adversaire` meta
    - Calendrier: duplicate → **skip**
@@ -80,12 +137,15 @@ Only `post_title` matters. Each post represents an opponent team. Created automa
 
 ```
 crbc-import-matchs/
-├── crbc-import-matchs.php      # Plugin bootstrap, constants, autoloader
+├── crbc-import-matchs.php      # Plugin bootstrap, constants, autoloader, JS enqueue
 ├── includes/
-│   ├── Admin.php               # Admin menu page, upload handling, file validation
-│   └── Importer.php            # Core import logic for both file types
+│   ├── Admin.php               # Admin menu, AJAX handlers (parse + batch)
+│   └── Importer.php            # Core import: parsing, fuzzy matching, row processing
 ├── views/
-│   └── admin-page.php          # Admin page HTML/CSS template
+│   └── admin-page.php          # Admin page: upload form, progress bars, live log, summary
+├── assets/
+│   └── js/
+│       └── crbc-import.js      # Vanilla JS: AJAX orchestration, progress UI, log rendering
 ├── composer.json               # PhpSpreadsheet dependency + PSR-4 autoload
 ├── composer.lock
 ├── vendor/                     # Composer autoload (gitignored)
@@ -102,42 +162,60 @@ crbc-import-matchs/
 | Method | Purpose |
 |---|---|
 | `add_menu_page()` | Registers admin page under Outils |
-| `handle_upload()` | Processes form submission (nonce + capability checks) |
-| `validate_file()` | Checks upload errors and `.xlsx` extension |
+| `ajax_parse_files()` | Phase 1: upload, validate, parse, store transient |
+| `ajax_process_batch()` | Phase 2: process N rows, return results + stats |
 | `render_page()` | Loads the admin view template |
 
 ### `CRBC\ImportMatchs\Importer`
 
-| Method | Purpose |
-|---|---|
-| `import_calendrier($path)` | Parses calendrier Excel file |
-| `import_resultats($path)` | Parses résultats Excel file |
-| `process_row()` | Processes one row: clean name, find/create opponent, check duplicates, create/update post |
-| `clean_opponent_name()` | Strips IE prefix and trailing suffixes |
-| `parse_date()` | Merges date + time, handles Excel serial numbers and floats |
-| `find_or_create_opponent()` | Case-insensitive lookup in `equipes-externes`, creates if missing |
-| `find_or_create_division()` | Ensures `equipes-crbc` term exists |
-| `find_existing_match()` | WP_Query by `date_du_match` + `adversaire` meta |
-| `create_match_post()` | Creates `matchs` post with all meta and taxonomy |
+| Method | Visibility | Purpose |
+|---|---|---|
+| `parse_file_to_rows($path, $type)` | public | Read Excel → array of normalized row data |
+| `ensure_opponents_loaded()` | public | Preload all equipes-externes into memory |
+| `process_row_data($entry, $type)` | public | Process one row: fuzzy match, duplicate check, create/update |
+| `import_calendrier($path)` | public | Full import of calendrier file (legacy convenience) |
+| `import_resultats($path)` | public | Full import of résultats file (legacy convenience) |
+| `clean_opponent_name($name)` | private | Strips IE prefix and trailing suffixes |
+| `parse_date($date, $time)` | private | Merges date + time, handles Excel serial numbers |
+| `find_or_create_opponent($name)` | private | Cascade fuzzy match → create if missing |
+| `find_or_create_division($div)` | private | Ensures equipes-crbc term exists |
+| `find_existing_match($date, $id)` | private | WP_Query by date_du_match + adversaire meta |
+| `create_match_post(...)` | private | Creates matchs post with all meta and taxonomy |
 
 ---
 
 ## Security
 
-- Nonce: `crbc_import_matchs_nonce` / action `crbc_import_matchs_action`
-- Capability: `manage_options`
-- File validation: only `.xlsx` extension accepted
-- All output escaped with `esc_html()`
+- **Nonce**: `crbc_import_matchs_action` — verified on all AJAX endpoints via `check_ajax_referer()`
+- **Capability**: `manage_options` — checked on all AJAX endpoints
+- **File validation**: only `.xlsx` extension accepted
+- **All output escaped** with `esc_html()`
+- **Temp files**: stored in `wp-content/uploads/crbc-import-tmp/`, cleaned up after processing
+
+---
+
+## Admin UI Flow
+
+1. User sees two file input zones (calendrier + résultats)
+2. Clicks "Analyser les fichiers" → JS sends files via fetch API
+3. Loading spinner shown during parse phase
+4. Progress section appears with bars per file type
+5. Batches process sequentially, updating bars and appending log items
+6. Each log item shows: icon + match title + action badge (created/updated/skipped/error)
+7. Fuzzy matches show "(fuzzy: MATCHED_NAME)" in the log
+8. Final summary cards display totals per category
 
 ---
 
 ## Extending / Maintaining
 
-- **New Excel columns**: Add to `process_row()` using `$header['Column Name']`
-- **New file type**: Add a method like `import_calendrier()` / `import_resultats()` and wire it in `Admin::handle_upload()`
+- **New Excel columns**: Add to `parse_file_to_rows()` parsing and `process_row_data()` logic
+- **New file type**: Add parsing in `parse_file_to_rows()`, wire in Admin AJAX handlers
 - **Change team name**: Update `Importer::TEAM_NAME` constant
 - **Change opponent cleaning rules**: Update `Importer::clean_opponent_name()`
+- **Change fuzzy match thresholds**: Update `find_or_create_opponent()` cascade logic
 - **Change duplicate logic**: Update `Importer::find_existing_match()` meta_query
+- **Change batch size**: Update `BATCH_SIZE` constant in `crbc-import.js`
 
 ### Dependencies
 
