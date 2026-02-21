@@ -10,7 +10,7 @@
     var resProgress = document.getElementById('crbc-res-progress');
     var logList = document.getElementById('crbc-log-list');
 
-    var BATCH_SIZE = 5;
+    var BATCH_SIZE = 20;
 
     form.addEventListener('submit', function (e) {
         e.preventDefault();

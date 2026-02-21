@@ -30,6 +30,7 @@ class Admin {
      * Phase 1 — Upload files, parse to rows, store in transient.
      */
     public function ajax_parse_files(): void {
+        wp_raise_memory_limit( 'admin' );
         check_ajax_referer( 'crbc_import_matchs_action', 'nonce' );
 
         if ( ! current_user_can( 'manage_options' ) ) {
@@ -109,6 +110,7 @@ class Admin {
      * Phase 2 — Process a batch of rows from the stored transient.
      */
     public function ajax_process_batch(): void {
+        wp_raise_memory_limit( 'admin' );
         check_ajax_referer( 'crbc_import_matchs_action', 'nonce' );
 
         if ( ! current_user_can( 'manage_options' ) ) {
@@ -118,7 +120,7 @@ class Admin {
         $job_id     = sanitize_text_field( $_POST['job_id'] ?? '' );
         $file_type  = sanitize_text_field( $_POST['file_type'] ?? '' );
         $offset     = absint( $_POST['offset'] ?? 0 );
-        $batch_size = absint( $_POST['batch_size'] ?? 5 );
+        $batch_size = absint( $_POST['batch_size'] ?? 20 );
 
         if ( ! $job_id || ! in_array( $file_type, [ 'calendrier', 'resultats' ], true ) ) {
             wp_send_json_error( [ 'message' => 'Paramètres invalides.' ] );
@@ -135,9 +137,30 @@ class Admin {
         $batch     = array_slice( $rows, $offset, $batch_size );
 
         $importer = new Importer();
-        $importer->ensure_opponents_loaded();
+
+        // Restore caches from transient (avoids re-querying DB on every batch)
+        if ( ! empty( $job_data['opponents_cache'] ) ) {
+            $importer->set_opponents_cache( $job_data['opponents_cache'] );
+        } else {
+            $importer->ensure_opponents_loaded();
+        }
+
+        if ( ! empty( $job_data['matches_cache'] ) ) {
+            $importer->set_matches_cache( $job_data['matches_cache'] );
+        } else {
+            $importer->ensure_matches_preloaded();
+        }
+
+        if ( ! empty( $job_data['divisions_cache'] ) ) {
+            $importer->set_divisions_cache( $job_data['divisions_cache'] );
+        } else {
+            $importer->ensure_divisions_loaded();
+        }
 
         $batch_results = [];
+
+        // Suspend cache invalidation during batch to reduce cache churn
+        wp_suspend_cache_invalidation( true );
 
         foreach ( $batch as $entry ) {
             $result = $importer->process_row_data( $entry, $file_type );
@@ -162,12 +185,18 @@ class Admin {
             }
         }
 
-        $new_processed     = $offset + count( $batch );
-        $file_data['processed'] = $new_processed;
-        $done              = $new_processed >= $total;
+        wp_suspend_cache_invalidation( false );
+        wp_cache_flush();
 
-        // Update transient
-        $job_data[ $file_type ] = $file_data;
+        $new_processed          = $offset + count( $batch );
+        $file_data['processed'] = $new_processed;
+        $done                   = $new_processed >= $total;
+
+        // Update transient with file data and caches
+        $job_data[ $file_type ]      = $file_data;
+        $job_data['opponents_cache'] = $importer->get_opponents_cache();
+        $job_data['matches_cache']   = $importer->get_matches_cache();
+        $job_data['divisions_cache'] = $importer->get_divisions_cache();
 
         if ( $done ) {
             // Clean up temp file
@@ -178,7 +207,7 @@ class Admin {
             // If both files are done, delete transient entirely
             $all_done = true;
             foreach ( $job_data as $key => $fdata ) {
-                if ( isset( $fdata['total'] ) && $fdata['processed'] < $fdata['total'] ) {
+                if ( is_array( $fdata ) && isset( $fdata['total'] ) && $fdata['processed'] < $fdata['total'] ) {
                     $all_done = false;
                     break;
                 }
