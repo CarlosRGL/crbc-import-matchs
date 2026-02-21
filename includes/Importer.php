@@ -22,6 +22,17 @@ class Importer {
     private array $all_opponents = [];
 
     /**
+     * In-memory cache of existing matches: ["date_opponent_id" => post_id].
+     * Populated once per import run via a single SQL query.
+     */
+    private array $existing_matches = [];
+
+    /**
+     * In-memory cache of equipes-crbc terms: [name_lower_or_slug => term_id].
+     */
+    private array $divisions = [];
+
+    /**
      * Load all equipes-externes into memory.
      */
     private function get_all_opponents(): array {
@@ -43,6 +54,99 @@ class Importer {
         if ( empty( $this->all_opponents ) ) {
             $this->all_opponents = $this->get_all_opponents();
         }
+    }
+
+    /**
+     * Preload all existing matches into memory with a single SQL query.
+     */
+    private function preload_existing_matches(): void {
+        global $wpdb;
+        $rows = $wpdb->get_results(
+            "SELECT p.ID,
+                    MAX(CASE WHEN pm.meta_key = 'date_du_match' THEN pm.meta_value END) AS match_date,
+                    MAX(CASE WHEN pm.meta_key = 'adversaire'    THEN pm.meta_value END) AS adversaire
+             FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+             WHERE p.post_type = 'matchs'
+               AND p.post_status NOT IN ('trash','auto-draft')
+               AND pm.meta_key IN ('date_du_match','adversaire')
+             GROUP BY p.ID
+             HAVING match_date IS NOT NULL AND adversaire IS NOT NULL"
+        );
+        $this->existing_matches = [];
+        foreach ( $rows as $r ) {
+            $key = $r->match_date . '_' . $r->adversaire;
+            $this->existing_matches[ $key ] = (int) $r->ID;
+        }
+    }
+
+    /**
+     * Ensure existing matches are preloaded.
+     */
+    public function ensure_matches_preloaded(): void {
+        if ( empty( $this->existing_matches ) ) {
+            $this->preload_existing_matches();
+        }
+    }
+
+    /**
+     * Preload all equipes-crbc taxonomy terms into memory.
+     */
+    private function preload_divisions(): void {
+        $terms = get_terms( [
+            'taxonomy'   => 'equipes-crbc',
+            'hide_empty' => false,
+            'fields'     => 'all',
+        ] );
+        $this->divisions = [];
+        if ( ! is_wp_error( $terms ) ) {
+            foreach ( $terms as $term ) {
+                $this->divisions[ strtolower( $term->name ) ] = $term->term_id;
+                $this->divisions[ $term->slug ]               = $term->term_id;
+            }
+        }
+    }
+
+    /**
+     * Ensure divisions are loaded.
+     */
+    public function ensure_divisions_loaded(): void {
+        if ( empty( $this->divisions ) ) {
+            $this->preload_divisions();
+        }
+    }
+
+    /**
+     * Ensure all caches are preloaded (opponents, matches, divisions).
+     */
+    public function ensure_all_preloaded(): void {
+        $this->ensure_opponents_loaded();
+        $this->ensure_matches_preloaded();
+        $this->ensure_divisions_loaded();
+    }
+
+    public function set_opponents_cache( array $opponents ): void {
+        $this->all_opponents = $opponents;
+    }
+
+    public function get_opponents_cache(): array {
+        return $this->all_opponents;
+    }
+
+    public function set_matches_cache( array $matches ): void {
+        $this->existing_matches = $matches;
+    }
+
+    public function get_matches_cache(): array {
+        return $this->existing_matches;
+    }
+
+    public function set_divisions_cache( array $divisions ): void {
+        $this->divisions = $divisions;
+    }
+
+    public function get_divisions_cache(): array {
+        return $this->divisions;
     }
 
     /**
@@ -123,7 +227,7 @@ class Importer {
             return $stats;
         }
 
-        $this->ensure_opponents_loaded();
+        $this->ensure_all_preloaded();
 
         foreach ( $rows as $entry ) {
             $result = $this->process_row_data( $entry, 'calendrier' );
@@ -153,7 +257,7 @@ class Importer {
             return $stats;
         }
 
-        $this->ensure_opponents_loaded();
+        $this->ensure_all_preloaded();
 
         foreach ( $rows as $entry ) {
             $result = $this->process_row_data( $entry, 'resultats' );
@@ -450,57 +554,37 @@ class Importer {
     }
 
     /**
-     * Find or create the equipes-crbc taxonomy term.
+     * Find or create the equipes-crbc taxonomy term (in-memory cache).
      */
     private function find_or_create_division( string $division ): void {
         if ( empty( $division ) ) {
             return;
         }
 
-        $term = get_term_by( 'name', $division, 'equipes-crbc' );
-        if ( $term ) {
+        $key = strtolower( $division );
+        if ( isset( $this->divisions[ $key ] ) || isset( $this->divisions[ sanitize_title( $division ) ] ) ) {
             return;
         }
 
-        $term = get_term_by( 'slug', sanitize_title( $division ), 'equipes-crbc' );
-        if ( $term ) {
-            return;
+        $result = wp_insert_term( $division, 'equipes-crbc' );
+        if ( ! is_wp_error( $result ) ) {
+            $this->divisions[ $key ]                        = $result['term_id'];
+            $this->divisions[ sanitize_title( $division ) ] = $result['term_id'];
         }
-
-        wp_insert_term( $division, 'equipes-crbc' );
     }
 
     /**
-     * Check for an existing match by date + opponent.
+     * Check for an existing match by date + opponent (O(1) array lookup).
      */
     private function find_existing_match( string $date, int $opponent_id ): ?int {
-        $query = new \WP_Query( [
-            'post_type'      => 'matchs',
-            'posts_per_page' => 1,
-            'post_status'    => 'any',
-            'no_found_rows'  => true,
-            'meta_query'     => [
-                'relation' => 'AND',
-                [
-                    'key'   => 'date_du_match',
-                    'value' => $date,
-                ],
-                [
-                    'key'   => 'adversaire',
-                    'value' => $opponent_id,
-                ],
-            ],
-        ] );
-
-        if ( $query->have_posts() ) {
-            return $query->posts[0]->ID;
-        }
-
-        return null;
+        $key = $date . '_' . $opponent_id;
+        return $this->existing_matches[ $key ] ?? null;
     }
 
     /**
      * Create a match post with all meta fields.
+     * Uses add_post_meta() instead of update_post_meta() on new posts to skip
+     * the unnecessary SELECT check.
      */
     private function create_match_post(
         string $title,
@@ -521,21 +605,24 @@ class Importer {
             return $post_id;
         }
 
-        update_post_meta( $post_id, 'date_du_match', $date );
-        update_post_meta( $post_id, 'adversaire', $opponent_id );
-        update_post_meta( $post_id, 'match_a_lexterieur', $is_away ? '1' : '0' );
+        add_post_meta( $post_id, 'date_du_match', $date, true );
+        add_post_meta( $post_id, 'adversaire', $opponent_id, true );
+        add_post_meta( $post_id, 'match_a_lexterieur', $is_away ? '1' : '0', true );
 
         if ( $score_crbc !== '' ) {
-            update_post_meta( $post_id, 'score_crbc', $score_crbc );
+            add_post_meta( $post_id, 'score_crbc', $score_crbc, true );
         }
         if ( $score_adv !== '' ) {
-            update_post_meta( $post_id, 'score_adversaire', $score_adv );
+            add_post_meta( $post_id, 'score_adversaire', $score_adv, true );
         }
 
         // Set taxonomy term
         if ( ! empty( $division ) ) {
             wp_set_object_terms( $post_id, $division, 'equipes-crbc' );
         }
+
+        // Add to in-memory cache so subsequent rows don't create duplicates
+        $this->existing_matches[ $date . '_' . $opponent_id ] = $post_id;
 
         return $post_id;
     }
