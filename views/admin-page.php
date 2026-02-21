@@ -6,71 +6,64 @@ if ( ! defined( 'ABSPATH' ) ) {
 <div class="wrap">
     <h1>Importer les matchs</h1>
 
-    <?php if ( ! empty( $results ) ) : ?>
-        <div class="crbc-import-results">
-            <?php foreach ( $results as $key => $data ) : ?>
-                <div class="crbc-result-section">
-                    <h2><?php echo esc_html( $data['label'] ); ?></h2>
-                    <table class="widefat striped">
-                        <tbody>
-                            <tr>
-                                <td>&#9989; Créés</td>
-                                <td><strong><?php echo (int) $data['created']; ?></strong></td>
-                            </tr>
-                            <?php if ( $key === 'resultats' ) : ?>
-                            <tr>
-                                <td>&#128260; Mis à jour</td>
-                                <td><strong><?php echo (int) $data['updated']; ?></strong></td>
-                            </tr>
-                            <?php endif; ?>
-                            <tr>
-                                <td>&#9193; Ignorés — doublons</td>
-                                <td><strong><?php echo (int) $data['skipped']; ?></strong></td>
-                            </tr>
-                            <tr>
-                                <td>&#10060; Erreurs</td>
-                                <td><strong><?php echo count( $data['errors'] ); ?></strong></td>
-                            </tr>
-                        </tbody>
-                    </table>
-
-                    <?php if ( ! empty( $data['errors'] ) ) : ?>
-                        <div class="notice notice-error" style="margin-top: 10px;">
-                            <ul style="margin: 0.5em 0; padding-left: 1.5em;">
-                                <?php foreach ( $data['errors'] as $error ) : ?>
-                                    <li><?php echo esc_html( $error ); ?></li>
-                                <?php endforeach; ?>
-                            </ul>
-                        </div>
-                    <?php endif; ?>
+    <!-- Upload Section -->
+    <div id="crbc-upload-section">
+        <form id="crbc-import-form" enctype="multipart/form-data">
+            <div class="crbc-upload-zones">
+                <div class="crbc-upload-zone">
+                    <h2>Calendrier (prochains matchs)</h2>
+                    <p class="description">Fichier Excel (.xlsx) contenant les rencontres à venir, sans scores.</p>
+                    <input type="file" name="calendrier" accept=".xlsx">
                 </div>
-            <?php endforeach; ?>
-        </div>
-        <hr>
-    <?php endif; ?>
 
-    <form method="post" enctype="multipart/form-data">
-        <?php wp_nonce_field( 'crbc_import_matchs_action', 'crbc_import_matchs_nonce' ); ?>
-
-        <div class="crbc-upload-zones">
-            <div class="crbc-upload-zone">
-                <h2>Calendrier (prochains matchs)</h2>
-                <p class="description">Fichier Excel (.xlsx) contenant les rencontres à venir, sans scores.</p>
-                <input type="file" name="calendrier" accept=".xlsx">
+                <div class="crbc-upload-zone">
+                    <h2>Résultats (matchs joués)</h2>
+                    <p class="description">Fichier Excel (.xlsx) contenant les résultats avec scores.</p>
+                    <input type="file" name="resultats" accept=".xlsx">
+                </div>
             </div>
 
-            <div class="crbc-upload-zone">
-                <h2>Résultats (matchs joués)</h2>
-                <p class="description">Fichier Excel (.xlsx) contenant les résultats avec scores.</p>
-                <input type="file" name="resultats" accept=".xlsx">
+            <p class="submit">
+                <button type="submit" class="button button-primary" id="crbc-submit-btn">Analyser les fichiers</button>
+            </p>
+        </form>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="crbc-loading" style="display:none;">
+        <div class="crbc-spinner"></div>
+        <p>Analyse des fichiers en cours…</p>
+    </div>
+
+    <!-- Progress Section -->
+    <div id="crbc-progress-section" style="display:none;">
+
+        <div id="crbc-cal-progress" class="crbc-progress-block" style="display:none;">
+            <h3>Calendrier</h3>
+            <div class="crbc-progress-bar-wrap">
+                <div class="crbc-progress-bar" id="crbc-cal-bar"></div>
             </div>
+            <span class="crbc-progress-label" id="crbc-cal-label">0 / 0 matchs</span>
         </div>
 
-        <?php submit_button( 'Importer', 'primary', 'submit', true ); ?>
-    </form>
+        <div id="crbc-res-progress" class="crbc-progress-block" style="display:none;">
+            <h3>Résultats</h3>
+            <div class="crbc-progress-bar-wrap">
+                <div class="crbc-progress-bar" id="crbc-res-bar"></div>
+            </div>
+            <span class="crbc-progress-label" id="crbc-res-label">0 / 0 matchs</span>
+        </div>
+
+        <h3>Journal d'import</h3>
+        <ul id="crbc-log-list" class="crbc-log"></ul>
+    </div>
+
+    <!-- Final Summary -->
+    <div id="crbc-summary-section" style="display:none;"></div>
 </div>
 
 <style>
+    /* Upload zones */
     .crbc-upload-zones {
         display: flex;
         gap: 30px;
@@ -83,25 +76,127 @@ if ( ! defined( 'ABSPATH' ) ) {
         padding: 20px;
         border-radius: 4px;
     }
-    .crbc-upload-zone h2 {
-        margin-top: 0;
+    .crbc-upload-zone h2 { margin-top: 0; }
+    .crbc-upload-zone input[type="file"] { margin-top: 10px; }
+
+    /* Loading */
+    #crbc-loading {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 60px 0;
     }
-    .crbc-upload-zone input[type="file"] {
+    .crbc-spinner {
+        width: 40px;
+        height: 40px;
+        border: 4px solid #c3c4c7;
+        border-top-color: #2271b1;
+        border-radius: 50%;
+        animation: crbc-spin 0.8s linear infinite;
+    }
+    @keyframes crbc-spin {
+        to { transform: rotate(360deg); }
+    }
+    #crbc-loading p {
+        margin-top: 15px;
+        color: #50575e;
+        font-size: 14px;
+    }
+
+    /* Progress */
+    .crbc-progress-block {
+        background: #fff;
+        border: 1px solid #c3c4c7;
+        border-radius: 4px;
+        padding: 15px 20px;
+        margin-bottom: 15px;
+    }
+    .crbc-progress-block h3 { margin: 0 0 10px; }
+    .crbc-progress-bar-wrap {
+        background: #e5e5e5;
+        border-radius: 4px;
+        height: 24px;
+        overflow: hidden;
+    }
+    .crbc-progress-bar {
+        background: #2271b1;
+        height: 100%;
+        width: 0%;
+        border-radius: 4px;
+        transition: width 0.3s ease;
+    }
+    .crbc-progress-label {
+        display: inline-block;
+        margin-top: 6px;
+        font-size: 13px;
+        color: #50575e;
+    }
+
+    /* Log */
+    .crbc-log {
+        background: #fff;
+        border: 1px solid #c3c4c7;
+        border-radius: 4px;
+        max-height: 400px;
+        overflow-y: auto;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 12px;
+    }
+    .crbc-log-heading {
+        padding: 10px 15px;
+        background: #f0f0f1;
+        font-weight: 600;
+        font-size: 13px;
+        border-bottom: 1px solid #c3c4c7;
+    }
+    .crbc-log-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 15px;
+        border-bottom: 1px solid #f0f0f1;
+    }
+    .crbc-log-icon { flex-shrink: 0; }
+    .crbc-log-title { flex: 1; }
+    .crbc-log-badge {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 3px;
+        font-weight: 500;
+        white-space: nowrap;
+    }
+    .crbc-badge-created { background: #d1fae5; color: #065f46; }
+    .crbc-badge-updated { background: #dbeafe; color: #1e40af; }
+    .crbc-badge-skipped { background: #f3f4f6; color: #6b7280; }
+    .crbc-badge-error   { background: #fee2e2; color: #991b1b; }
+    .crbc-log-message {
+        display: block;
+        width: 100%;
+        font-size: 11px;
+        color: #991b1b;
+        padding-left: 28px;
+    }
+
+    /* Summary */
+    .crbc-summary-grid {
+        display: flex;
+        gap: 20px;
         margin-top: 10px;
     }
-    .crbc-import-results {
-        display: flex;
-        gap: 30px;
-        margin: 20px 0;
-    }
-    .crbc-result-section {
+    .crbc-summary-card {
         flex: 1;
         background: #fff;
         border: 1px solid #c3c4c7;
-        padding: 20px;
         border-radius: 4px;
+        padding: 20px;
     }
-    .crbc-result-section h2 {
-        margin-top: 0;
+    .crbc-summary-card h3 { margin: 0 0 12px; }
+    .crbc-summary-row {
+        padding: 4px 0;
+        font-size: 14px;
     }
 </style>

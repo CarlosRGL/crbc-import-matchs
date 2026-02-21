@@ -28,3 +28,23 @@ add_action( 'plugins_loaded', function () {
         new \CRBC\ImportMatchs\Admin();
     }
 } );
+
+// Enqueue admin JS on plugin page only
+add_action( 'admin_enqueue_scripts', function ( $hook ) {
+    if ( $hook !== 'tools_page_crbc-import-matchs' ) {
+        return;
+    }
+
+    wp_enqueue_script(
+        'crbc-import-js',
+        CRBC_IMPORT_MATCHS_URL . 'assets/js/crbc-import.js',
+        [],
+        CRBC_IMPORT_MATCHS_VERSION,
+        true
+    );
+
+    wp_localize_script( 'crbc-import-js', 'crbcImport', [
+        'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+        'nonce'   => wp_create_nonce( 'crbc_import_matchs_action' ),
+    ] );
+} );
