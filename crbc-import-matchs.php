@@ -31,7 +31,7 @@ add_action( 'plugins_loaded', function () {
 
 // Enqueue admin JS on plugin page only
 add_action( 'admin_enqueue_scripts', function ( $hook ) {
-    if ( $hook !== 'tools_page_crbc-import-matchs' ) {
+    if ( $hook !== 'matchs_page_crbc-import-matchs' ) {
         return;
     }
 

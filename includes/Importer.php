@@ -158,7 +158,9 @@ class Importer {
      * @throws \Exception If the file cannot be read.
      */
     public function parse_file_to_rows( string $filepath, string $type ): array {
-        $spreadsheet = IOFactory::load( $filepath );
+        $reader = IOFactory::createReader( 'Xlsx' );
+        $reader->setReadDataOnly( true );
+        $spreadsheet = $reader->load( $filepath );
 
         if ( $type === 'calendrier' ) {
             $sheet = $this->find_calendrier_sheet( $spreadsheet );
@@ -169,7 +171,11 @@ class Importer {
             $sheet = $spreadsheet->getSheet( 0 );
         }
 
-        $rows   = $sheet->toArray( null, true, true, true );
+        $rows   = $sheet->toArray( null, true, true, false );
+
+        $spreadsheet->disconnectWorksheets();
+        unset( $spreadsheet );
+
         $header = null;
         $result = [];
 

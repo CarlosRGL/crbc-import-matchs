@@ -17,7 +17,8 @@ class Admin {
     }
 
     public function add_menu_page(): void {
-        add_management_page(
+        add_submenu_page(
+            'edit.php?post_type=matchs',
             'Importer les matchs',
             'Importer les matchs',
             'manage_options',
@@ -31,6 +32,9 @@ class Admin {
      */
     public function ajax_parse_files(): void {
         wp_raise_memory_limit( 'admin' );
+        if ( function_exists( 'set_time_limit' ) ) {
+            set_time_limit( 120 );
+        }
         check_ajax_referer( 'crbc_import_matchs_action', 'nonce' );
 
         if ( ! current_user_can( 'manage_options' ) ) {
@@ -73,11 +77,17 @@ class Admin {
                 wp_send_json_error( [ 'message' => "Erreur parsing $type : " . $e->getMessage() ] );
             }
 
+            // Store rows as JSON file on disk — keeps the transient tiny (no blob in MySQL)
+            $rows_path = $tmp_dir . $job_id . '-' . $type . '-rows.json';
+            $count     = count( $rows );
+            file_put_contents( $rows_path, wp_json_encode( $rows ) );
+            unset( $rows ); // free memory immediately
+
             $job_data[ $type ] = [
-                'rows'      => $rows,
-                'total'     => count( $rows ),
+                'total'     => $count,
                 'processed' => 0,
                 'file_path' => $dest,
+                'rows_path' => $rows_path,
                 'stats'     => [
                     'created' => 0,
                     'updated' => 0,
@@ -87,9 +97,9 @@ class Admin {
             ];
 
             if ( $type === 'calendrier' ) {
-                $total_cal = count( $rows );
+                $total_cal = $count;
             } else {
-                $total_res = count( $rows );
+                $total_res = $count;
             }
         }
 
@@ -132,9 +142,16 @@ class Admin {
         }
 
         $file_data = $job_data[ $file_type ];
-        $rows      = $file_data['rows'];
         $total     = $file_data['total'];
-        $batch     = array_slice( $rows, $offset, $batch_size );
+
+        // Read rows from JSON file on disk — avoids deserializing a huge blob from MySQL
+        $rows_path = $file_data['rows_path'] ?? '';
+        if ( ! $rows_path || ! file_exists( $rows_path ) ) {
+            wp_send_json_error( [ 'message' => 'Fichier de données introuvable (expiré ?).' ] );
+        }
+        $all_rows = json_decode( file_get_contents( $rows_path ), true );
+        $batch    = array_slice( $all_rows, $offset, $batch_size );
+        unset( $all_rows ); // free immediately
 
         $importer = new Importer();
 
@@ -186,7 +203,7 @@ class Admin {
         }
 
         wp_suspend_cache_invalidation( false );
-        wp_cache_flush();
+        // No wp_cache_flush() — flushing the entire cache is destructive and unnecessary
 
         $new_processed          = $offset + count( $batch );
         $file_data['processed'] = $new_processed;
@@ -199,9 +216,12 @@ class Admin {
         $job_data['divisions_cache'] = $importer->get_divisions_cache();
 
         if ( $done ) {
-            // Clean up temp file
+            // Clean up temp files (xlsx + json)
             if ( ! empty( $file_data['file_path'] ) && file_exists( $file_data['file_path'] ) ) {
                 @unlink( $file_data['file_path'] );
+            }
+            if ( ! empty( $file_data['rows_path'] ) && file_exists( $file_data['rows_path'] ) ) {
+                @unlink( $file_data['rows_path'] );
             }
 
             // If both files are done, delete transient entirely
