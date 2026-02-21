@@ -16,25 +16,58 @@ class Importer {
     private const TEAM_NAME = 'CANET RBC';
 
     /**
-     * Import calendrier file (future matches, no scores).
+     * In-memory cache of all equipes-externes: [ID => post_title].
+     * Populated once per import run, updated when new opponents are created.
      */
-    public function import_calendrier( string $filepath ): array {
-        $stats = [ 'created' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => [] ];
+    private array $all_opponents = [];
 
-        try {
-            $spreadsheet = IOFactory::load( $filepath );
+    /**
+     * Load all equipes-externes into memory.
+     */
+    private function get_all_opponents(): array {
+        global $wpdb;
+        $rows = $wpdb->get_results(
+            "SELECT ID, post_title FROM {$wpdb->posts} WHERE post_type='equipes-externes' AND post_status IN ('publish','draft') ORDER BY ID"
+        );
+        $result = [];
+        foreach ( $rows as $r ) {
+            $result[ (int) $r->ID ] = trim( $r->post_title );
+        }
+        return $result;
+    }
+
+    /**
+     * Ensure opponents are loaded (call once at start of batch).
+     */
+    public function ensure_opponents_loaded(): void {
+        if ( empty( $this->all_opponents ) ) {
+            $this->all_opponents = $this->get_all_opponents();
+        }
+    }
+
+    /**
+     * Parse an Excel file into normalized row data without performing any WP operations.
+     *
+     * @param string $filepath Path to the .xlsx file.
+     * @param string $type     'calendrier' or 'resultats'.
+     * @return array Array of assoc arrays with keys: division, equipe1, equipe2, date_raw, heure_raw, score1, score2.
+     * @throws \Exception If the file cannot be read.
+     */
+    public function parse_file_to_rows( string $filepath, string $type ): array {
+        $spreadsheet = IOFactory::load( $filepath );
+
+        if ( $type === 'calendrier' ) {
             $sheet = $this->find_calendrier_sheet( $spreadsheet );
             if ( ! $sheet ) {
-                $stats['errors'][] = 'Feuille "rechercherRencontre" introuvable dans le fichier.';
-                return $stats;
+                throw new \Exception( 'Feuille "rechercherRencontre" introuvable dans le fichier.' );
             }
-        } catch ( \Exception $e ) {
-            $stats['errors'][] = 'Impossible de lire le fichier : ' . $e->getMessage();
-            return $stats;
+        } else {
+            $sheet = $spreadsheet->getSheet( 0 );
         }
 
-        $rows = $sheet->toArray( null, true, true, true );
+        $rows   = $sheet->toArray( null, true, true, true );
         $header = null;
+        $result = [];
 
         foreach ( $rows as $row_num => $row ) {
             if ( ! $header ) {
@@ -42,14 +75,63 @@ class Importer {
                 continue;
             }
 
-            $result = $this->process_row( $row, $header, 'calendrier', $row_num );
+            $equipe1 = trim( $row[ $header['Equipe 1'] ] ?? '' );
+            $equipe2 = trim( $row[ $header['Equipe 2'] ] ?? '' );
+
+            // Skip empty rows
+            if ( empty( $equipe1 ) && empty( $equipe2 ) ) {
+                continue;
+            }
+
+            // Skip exempt
+            if ( strcasecmp( $equipe1, 'Exempt' ) === 0 || strcasecmp( $equipe2, 'Exempt' ) === 0 ) {
+                continue;
+            }
+
+            $entry = [
+                'division'  => trim( $row[ $header['Division'] ] ?? '' ),
+                'equipe1'   => $equipe1,
+                'equipe2'   => $equipe2,
+                'date_raw'  => $row[ $header['Date de rencontre'] ] ?? '',
+                'heure_raw' => $row[ $header['Heure'] ] ?? '',
+                'score1'    => '',
+                'score2'    => '',
+                'row_num'   => $row_num,
+            ];
+
+            if ( $type === 'resultats' && isset( $header['Score 1'], $header['Score 2'] ) ) {
+                $entry['score1'] = trim( $row[ $header['Score 1'] ] ?? '' );
+                $entry['score2'] = trim( $row[ $header['Score 2'] ] ?? '' );
+            }
+
+            $result[] = $entry;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Import calendrier file (future matches, no scores).
+     */
+    public function import_calendrier( string $filepath ): array {
+        $stats = [ 'created' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => [] ];
+
+        try {
+            $rows = $this->parse_file_to_rows( $filepath, 'calendrier' );
+        } catch ( \Exception $e ) {
+            $stats['errors'][] = $e->getMessage();
+            return $stats;
+        }
+
+        $this->ensure_opponents_loaded();
+
+        foreach ( $rows as $entry ) {
+            $result = $this->process_row_data( $entry, 'calendrier' );
 
             if ( $result === 'created' ) {
                 $stats['created']++;
             } elseif ( $result === 'skipped' ) {
                 $stats['skipped']++;
-            } elseif ( $result === 'skip_exempt' ) {
-                // silently skip exempt rows
             } elseif ( is_string( $result ) ) {
                 $stats['errors'][] = $result;
             }
@@ -65,23 +147,16 @@ class Importer {
         $stats = [ 'created' => 0, 'updated' => 0, 'skipped' => 0, 'errors' => [] ];
 
         try {
-            $spreadsheet = IOFactory::load( $filepath );
-            $sheet = $spreadsheet->getSheet( 0 );
+            $rows = $this->parse_file_to_rows( $filepath, 'resultats' );
         } catch ( \Exception $e ) {
-            $stats['errors'][] = 'Impossible de lire le fichier : ' . $e->getMessage();
+            $stats['errors'][] = $e->getMessage();
             return $stats;
         }
 
-        $rows = $sheet->toArray( null, true, true, true );
-        $header = null;
+        $this->ensure_opponents_loaded();
 
-        foreach ( $rows as $row_num => $row ) {
-            if ( ! $header ) {
-                $header = $this->map_header( $row );
-                continue;
-            }
-
-            $result = $this->process_row( $row, $header, 'resultats', $row_num );
+        foreach ( $rows as $entry ) {
+            $result = $this->process_row_data( $entry, 'resultats' );
 
             if ( $result === 'created' ) {
                 $stats['created']++;
@@ -89,8 +164,6 @@ class Importer {
                 $stats['updated']++;
             } elseif ( $result === 'skipped' ) {
                 $stats['skipped']++;
-            } elseif ( $result === 'skip_exempt' ) {
-                // silently skip exempt rows
             } elseif ( is_string( $result ) ) {
                 $stats['errors'][] = $result;
             }
@@ -100,83 +173,105 @@ class Importer {
     }
 
     /**
-     * Process a single row from either file type.
+     * Process a single normalized row from either file type.
+     * Used by both the legacy full-import methods and the new batch processor.
      *
-     * @return string 'created'|'updated'|'skipped'|'skip_exempt' or error message
+     * @param array  $entry Assoc array from parse_file_to_rows().
+     * @param string $type  'calendrier' or 'resultats'.
+     * @return array ['action' => 'created'|'updated'|'skipped'|'error', 'title' => '...', 'message' => '...', 'matched_as' => '...']
      */
-    private function process_row( array $row, array $header, string $type, int $row_num ): string {
-        $division = trim( $row[ $header['Division'] ] ?? '' );
-        $equipe1  = trim( $row[ $header['Equipe 1'] ] ?? '' );
-        $equipe2  = trim( $row[ $header['Equipe 2'] ] ?? '' );
-        $date_raw = $row[ $header['Date de rencontre'] ] ?? '';
-        $heure_raw = $row[ $header['Heure'] ] ?? '';
-
-        // Skip empty rows
-        if ( empty( $equipe1 ) && empty( $equipe2 ) ) {
-            return 'skip_exempt';
-        }
-
-        // Skip exempt
-        if ( strcasecmp( $equipe1, 'Exempt' ) === 0 || strcasecmp( $equipe2, 'Exempt' ) === 0 ) {
-            return 'skip_exempt';
-        }
+    public function process_row_data( array $entry, string $type ): array|string {
+        $division  = $entry['division'];
+        $equipe1   = $entry['equipe1'];
+        $equipe2   = $entry['equipe2'];
+        $date_raw  = $entry['date_raw'];
+        $heure_raw = $entry['heure_raw'];
+        $row_num   = $entry['row_num'] ?? '?';
 
         // Detect home/away
         if ( stripos( $equipe1, self::TEAM_NAME ) !== false ) {
-            $is_away = false;
+            $is_away      = false;
             $opponent_raw = $equipe2;
         } elseif ( stripos( $equipe2, self::TEAM_NAME ) !== false ) {
-            $is_away = true;
+            $is_away      = true;
             $opponent_raw = $equipe1;
         } else {
-            return "Ligne $row_num : ni Equipe 1 ni Equipe 2 ne contient « " . self::TEAM_NAME . " ».";
+            return [
+                'action'  => 'error',
+                'title'   => "$equipe1 - $equipe2",
+                'message' => "Ligne $row_num : ni Equipe 1 ni Equipe 2 ne contient « " . self::TEAM_NAME . ' ».',
+            ];
         }
 
         // Clean opponent name
         $opponent = $this->clean_opponent_name( $opponent_raw );
         if ( empty( $opponent ) ) {
-            return "Ligne $row_num : nom d'adversaire vide après nettoyage.";
+            return [
+                'action'  => 'error',
+                'title'   => "$equipe1 - $equipe2",
+                'message' => "Ligne $row_num : nom d'adversaire vide après nettoyage.",
+            ];
         }
-
-        // Parse date
-        $match_date = $this->parse_date( $date_raw, $heure_raw );
-        if ( ! $match_date ) {
-            return "Ligne $row_num : date invalide ($date_raw $heure_raw).";
-        }
-
-        // Find or create opponent (equipes-externes)
-        $opponent_id = $this->find_or_create_opponent( $opponent );
-        if ( is_wp_error( $opponent_id ) ) {
-            return "Ligne $row_num : " . $opponent_id->get_error_message();
-        }
-
-        // Find or create division taxonomy term
-        $this->find_or_create_division( $division );
 
         // Build title
         $title = $is_away
             ? $opponent . ' - CRBC'
             : 'CRBC - ' . $opponent;
 
+        // Parse date
+        $match_date = $this->parse_date( $date_raw, $heure_raw );
+        if ( ! $match_date ) {
+            return [
+                'action'  => 'error',
+                'title'   => $title,
+                'message' => "Ligne $row_num : date invalide ($date_raw $heure_raw).",
+            ];
+        }
+
+        // Find or create opponent (equipes-externes) with fuzzy matching
+        $match_info   = $this->find_or_create_opponent( $opponent );
+        $opponent_id  = $match_info['id'];
+        $matched_as   = $match_info['matched_as'] ?? null;
+
+        if ( is_wp_error( $opponent_id ) ) {
+            return [
+                'action'  => 'error',
+                'title'   => $title,
+                'message' => "Ligne $row_num : " . $opponent_id->get_error_message(),
+            ];
+        }
+
+        // Find or create division taxonomy term
+        $this->find_or_create_division( $division );
+
         // Duplicate check
         $existing = $this->find_existing_match( $match_date, $opponent_id );
 
+        $result = [
+            'title'      => $title,
+            'matched_as' => $matched_as,
+        ];
+
         if ( $type === 'calendrier' ) {
             if ( $existing ) {
-                return 'skipped';
+                $result['action'] = 'skipped';
+                return $result;
             }
 
             $post_id = $this->create_match_post( $title, $match_date, $opponent_id, $is_away, $division );
             if ( is_wp_error( $post_id ) ) {
-                return "Ligne $row_num : " . $post_id->get_error_message();
+                $result['action']  = 'error';
+                $result['message'] = "Ligne $row_num : " . $post_id->get_error_message();
+                return $result;
             }
 
-            return 'created';
+            $result['action'] = 'created';
+            return $result;
         }
 
         // Résultats
-        $score1 = trim( $row[ $header['Score 1'] ] ?? '' );
-        $score2 = trim( $row[ $header['Score 2'] ] ?? '' );
+        $score1 = $entry['score1'];
+        $score2 = $entry['score2'];
 
         if ( ! $is_away ) {
             $score_crbc = $score1;
@@ -189,15 +284,19 @@ class Importer {
         if ( $existing ) {
             update_post_meta( $existing, 'score_crbc', $score_crbc );
             update_post_meta( $existing, 'score_adversaire', $score_adv );
-            return 'updated';
+            $result['action'] = 'updated';
+            return $result;
         }
 
         $post_id = $this->create_match_post( $title, $match_date, $opponent_id, $is_away, $division, $score_crbc, $score_adv );
         if ( is_wp_error( $post_id ) ) {
-            return "Ligne $row_num : " . $post_id->get_error_message();
+            $result['action']  = 'error';
+            $result['message'] = "Ligne $row_num : " . $post_id->get_error_message();
+            return $result;
         }
 
-        return 'created';
+        $result['action'] = 'created';
+        return $result;
     }
 
     /**
@@ -275,43 +374,79 @@ class Importer {
     }
 
     /**
-     * Find equipes-externes post by name (case-insensitive), or create one.
+     * Find equipes-externes post by name using cascade fuzzy matching, or create one.
+     *
+     * Cascade:
+     * 1. Exact match (case-insensitive, trimmed)
+     * 2. WP title contained in opponent name (longest wins)
+     * 3. Opponent name contained in WP title
+     * 4. similar_text() score > 60%
+     * 5. Create new post
+     *
+     * @return array ['id' => int|WP_Error, 'matched_as' => string|null]
      */
-    private function find_or_create_opponent( string $name ): int|\WP_Error {
-        $query = new \WP_Query( [
-            'post_type'      => 'equipes-externes',
-            'posts_per_page' => 1,
-            'post_status'    => 'any',
-            'title'          => $name,
-            'no_found_rows'  => true,
-        ] );
+    private function find_or_create_opponent( string $name ): array {
+        $name_lower = strtolower( trim( $name ) );
 
-        // WP_Query 'title' is exact but case-sensitive; fallback to manual search
-        if ( $query->have_posts() ) {
-            return $query->posts[0]->ID;
+        // Step 1 — Exact match
+        foreach ( $this->all_opponents as $id => $existing_title ) {
+            if ( strtolower( trim( $existing_title ) ) === $name_lower ) {
+                return [ 'id' => $id, 'matched_as' => null ];
+            }
         }
 
-        // Case-insensitive search
-        global $wpdb;
-        $post_id = $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT ID FROM {$wpdb->posts} WHERE post_type = 'equipes-externes' AND post_status IN ('publish','draft') AND LOWER(TRIM(post_title)) = LOWER(TRIM(%s)) LIMIT 1",
-                $name
-            )
-        );
-
-        if ( $post_id ) {
-            return (int) $post_id;
+        // Step 2 — WP title contained in opponent name (longest wins)
+        $best_id     = null;
+        $best_length = 0;
+        foreach ( $this->all_opponents as $id => $existing_title ) {
+            $existing_lower = strtolower( trim( $existing_title ) );
+            if ( $existing_lower !== '' && stripos( $name, $existing_title ) !== false ) {
+                $len = mb_strlen( $existing_title );
+                if ( $len > $best_length ) {
+                    $best_length = $len;
+                    $best_id     = $id;
+                }
+            }
+        }
+        if ( $best_id !== null ) {
+            return [ 'id' => $best_id, 'matched_as' => $this->all_opponents[ $best_id ] ];
         }
 
-        // Create new
+        // Step 3 — Opponent name contained in WP title
+        foreach ( $this->all_opponents as $id => $existing_title ) {
+            if ( $name_lower !== '' && stripos( $existing_title, $name ) !== false ) {
+                return [ 'id' => $id, 'matched_as' => $existing_title ];
+            }
+        }
+
+        // Step 4 — similar_text() score > 60%
+        $best_id  = null;
+        $best_pct = 0.0;
+        foreach ( $this->all_opponents as $id => $existing_title ) {
+            $existing_lower = strtolower( trim( $existing_title ) );
+            similar_text( $name_lower, $existing_lower, $pct );
+            if ( $pct > $best_pct ) {
+                $best_pct = $pct;
+                $best_id  = $id;
+            }
+        }
+        if ( $best_pct > 60 && $best_id !== null ) {
+            return [ 'id' => $best_id, 'matched_as' => $this->all_opponents[ $best_id ] ];
+        }
+
+        // Step 5 — Create new
         $new_id = wp_insert_post( [
             'post_type'   => 'equipes-externes',
             'post_title'  => $name,
             'post_status' => 'publish',
         ], true );
 
-        return $new_id;
+        if ( ! is_wp_error( $new_id ) ) {
+            // Add to in-memory cache
+            $this->all_opponents[ $new_id ] = $name;
+        }
+
+        return [ 'id' => $new_id, 'matched_as' => null ];
     }
 
     /**
