@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer
+
+      - name: Install dependencies (no dev)
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: Build zip
+        run: |
+          PLUGIN_SLUG="crbc-import-matchs"
+          VERSION="${GITHUB_REF_NAME}"
+
+          # Créer le zip avec le bon dossier racine (requis par WP)
+          mkdir -p /tmp/${PLUGIN_SLUG}
+          rsync -r \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='*.DS_Store' \
+            ./ /tmp/${PLUGIN_SLUG}/
+
+          cd /tmp
+          zip -r ${PLUGIN_SLUG}-${VERSION}.zip ${PLUGIN_SLUG}/
+          echo "ZIP_PATH=/tmp/${PLUGIN_SLUG}-${VERSION}.zip" >> $GITHUB_ENV
+          echo "ZIP_NAME=${PLUGIN_SLUG}-${VERSION}.zip" >> $GITHUB_ENV
+
+      - name: Upload zip to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
